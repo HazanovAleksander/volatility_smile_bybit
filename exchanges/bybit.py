@@ -9,6 +9,7 @@ mark IV (markIv), markPrice, греки (delta/gamma/theta/vega), а также
 indexPrice (спот) и underlyingPrice (перпетуал — для implied rate).
 """
 
+import logging
 import re
 import threading
 import time
@@ -18,6 +19,8 @@ import requests
 
 from exchanges.base import DataSource, NormalizedOption
 import net
+
+logger = logging.getLogger("volatility_smile_bybit")
 
 BYBIT_BASE_URL = "https://api.bybit.com"
 
@@ -111,6 +114,11 @@ _tickers_cache = {}
 _tickers_cache_lock = threading.Lock()
 _TICKERS_CACHE_TTL = 60
 
+#: Bybit сигнализирует API-ошибки (rate limit и т.п.) HTTP 200 + retCode != 0
+#: без result.list. Такие сбои перемежающиеся — ретраим на нашем уровне.
+_TICKERS_MAX_ATTEMPTS = 3
+_TICKERS_BACKOFF_BASE_SECONDS = 0.5
+
 
 class BybitAdapter(DataSource):
     label = "Bybit"
@@ -132,23 +140,64 @@ class BybitAdapter(DataSource):
 
         url = f"{BYBIT_BASE_URL}/v5/market/tickers"
         params = {"category": "option", "baseCoin": base_coin}
-        try:
-            payload = net.get_json(url, params=params)
-        except requests.RequestException as exc:
-            raise RuntimeError(
-                f"Не удалось загрузить опционные тикеры Bybit для {base_coin} "
-                f"после нескольких попыток."
-            ) from exc
-        except ValueError as exc:
-            raise RuntimeError("Bybit вернул невалидный JSON-ответ.") from exc
 
-        tickers = payload.get("result", {}).get("list")
+        last_error = None
+        for attempt in range(1, _TICKERS_MAX_ATTEMPTS + 1):
+            try:
+                payload = net.get_json(url, params=params)
+            except requests.RequestException as exc:
+                raise RuntimeError(
+                    f"Не удалось загрузить опционные тикеры Bybit для {base_coin} "
+                    f"после нескольких попыток."
+                ) from exc
+            except ValueError as exc:
+                raise RuntimeError("Bybit вернул невалидный JSON-ответ.") from exc
+
+            if not isinstance(payload, dict):
+                last_error = RuntimeError(
+                    f"Bybit вернул неожиданный формат ответа для {base_coin}: "
+                    f"{payload!r}."
+                )
+            else:
+                last_error = self._validate_tickers_payload(base_coin, payload)
+
+            if last_error is None:
+                tickers = payload["result"]["list"]
+                with _tickers_cache_lock:
+                    _tickers_cache[base_coin] = {"ts": now_ts, "tickers": tickers}
+                return tickers
+
+            logger.warning(
+                "Bybit tickers request for %s failed (attempt %s/%s): %s",
+                base_coin,
+                attempt,
+                _TICKERS_MAX_ATTEMPTS,
+                last_error,
+            )
+            if attempt < _TICKERS_MAX_ATTEMPTS:
+                time.sleep(_TICKERS_BACKOFF_BASE_SECONDS * attempt)
+
+        raise last_error
+
+    @staticmethod
+    def _validate_tickers_payload(base_coin, payload):
+        """Проверяет структуру ответа Bybit. Возвращает RuntimeError с
+        диагностикой при проблеме или None, если ответ валиден."""
+        ret_code = payload.get("retCode")
+        result = payload.get("result")
+        tickers = result.get("list") if isinstance(result, dict) else None
+
+        if ret_code != 0:
+            return RuntimeError(
+                f"Bybit вернул ошибку API для {base_coin}: "
+                f"retCode={ret_code}, retMsg={payload.get('retMsg')!r}."
+            )
         if not isinstance(tickers, list):
-            raise RuntimeError("Bybit вернул неожиданный формат данных для списка тикеров.")
-
-        with _tickers_cache_lock:
-            _tickers_cache[base_coin] = {"ts": now_ts, "tickers": tickers}
-        return tickers
+            return RuntimeError(
+                "Bybit вернул неожиданный формат данных для списка тикеров "
+                f"({base_coin}): result={result!r}."
+            )
+        return None
 
     def fetch(self, coin):
         config = COIN_ALIASES.get(coin)

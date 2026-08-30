@@ -9,14 +9,18 @@
 
 import sys
 import os
+import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import net
 import exchanges
+from exchanges import bybit as bybit_module
 from exchanges.bybit import BybitAdapter, parse_symbol as bybit_parse_symbol
 from exchanges.deribit import DeribitAdapter, parse_instrument_name as deribit_parse
 from exchanges.okx import OkxAdapter
@@ -207,6 +211,115 @@ def test_bybit_gold_option_base_coin_matches_ui_name(monkeypatch):
     # Имитируем фильтр collect_strikes из app.py — должны пройти все опционы.
     strikes = sorted({o.strike for o in options if o.base_coin == "XAUTUSDT"})
     assert strikes == [4200.0]
+
+
+# --------------------------------------------------------------------------------------
+# Bybit: get_tickers — API-ошибки (retCode != 0) и unexpected формат ответа
+# --------------------------------------------------------------------------------------
+
+def _reset_bybit_tickers_cache():
+    with bybit_module._tickers_cache_lock:
+        bybit_module._tickers_cache.clear()
+
+
+def _freeze_bybit_sleep(monkeypatch):
+    """Подменяет time.sleep в модуле bybit, чтобы тесты не ждали бэкофф."""
+    sleeps = []
+    monkeypatch.setattr(
+        bybit_module, "time", SimpleNamespace(time=time.time, sleep=sleeps.append)
+    )
+    return sleeps
+
+
+def test_bybit_tickers_api_error_raises_with_retmsg(monkeypatch):
+    """Bybit сообщает об API-ошибках (rate limit и т.п.) как HTTP 200 с
+    retCode != 0 и без result.list. Ошибка должна ретраиться и после
+    последней попытки превращаться в RuntimeError с retCode/retMsg."""
+    _reset_bybit_tickers_cache()
+    sleeps = _freeze_bybit_sleep(monkeypatch)
+    calls = []
+
+    def fake_get_json(url, *, params=None, timeout=net.REQUEST_TIMEOUT):
+        calls.append(params)
+        return {"retCode": 10006, "retMsg": "Too many visits", "result": {}}
+
+    monkeypatch.setattr(net, "get_json", fake_get_json)
+
+    with pytest.raises(RuntimeError, match="Too many visits"):
+        BybitAdapter().get_tickers("SOL")
+
+    assert len(calls) == bybit_module._TICKERS_MAX_ATTEMPTS
+    assert calls[0] == {"category": "option", "baseCoin": "SOL"}
+    assert sleeps == [0.5, 1.0]
+    # Неудачные ответы не должны попадать в кеш.
+    assert "SOL" not in bybit_module._tickers_cache
+
+
+def test_bybit_tickers_missing_result_list_raises(monkeypatch):
+    """retCode == 0, но result не dict (null) или без list — понятная
+    RuntimeError вместо AttributeError / общей ошибки."""
+    _reset_bybit_tickers_cache()
+    _freeze_bybit_sleep(monkeypatch)
+
+    for payload in ({"retCode": 0, "result": {}}, {"retCode": 0, "result": None}):
+        _reset_bybit_tickers_cache()
+        monkeypatch.setattr(net, "get_json", lambda url, **kw: payload)
+        with pytest.raises(RuntimeError, match="неожиданный формат данных"):
+            BybitAdapter().get_tickers("SOL")
+    assert "SOL" not in bybit_module._tickers_cache
+
+
+def test_bybit_tickers_retries_transient_error(monkeypatch):
+    """Транзиентная API-ошибка (например rate limit) на первой попытке —
+    get_tickers должен ретраить и вернуть список со второй."""
+    _reset_bybit_tickers_cache()
+    sleeps = _freeze_bybit_sleep(monkeypatch)
+    responses = [
+        {"retCode": 10006, "retMsg": "Too many visits", "result": {}},
+        {
+            "retCode": 0,
+            "retMsg": "SUCCESS",
+            "result": {"category": "option", "list": [{"symbol": "SOL-4SEP26-70-C-USDT"}]},
+        },
+    ]
+    calls = []
+
+    def fake_get_json(url, *, params=None, timeout=net.REQUEST_TIMEOUT):
+        calls.append(params)
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(net, "get_json", fake_get_json)
+
+    tickers = BybitAdapter().get_tickers("SOL")
+
+    assert tickers == [{"symbol": "SOL-4SEP26-70-C-USDT"}]
+    assert len(calls) == 2
+    assert sleeps == [0.5]
+    # Успешный ответ попадает в кеш.
+    assert bybit_module._tickers_cache["SOL"]["tickers"] == tickers
+
+
+def test_bybit_tickers_caches_success(monkeypatch):
+    """Успешный ответ кешируется: повторный вызов в пределах TTL не ходит в сеть."""
+    _reset_bybit_tickers_cache()
+    calls = []
+
+    def fake_get_json(url, *, params=None, timeout=net.REQUEST_TIMEOUT):
+        calls.append(params)
+        return {
+            "retCode": 0,
+            "retMsg": "SUCCESS",
+            "result": {"category": "option", "list": [{"symbol": "BTC-28MAR26-100000-C-USDT"}]},
+        }
+
+    monkeypatch.setattr(net, "get_json", fake_get_json)
+
+    adapter = BybitAdapter()
+    first = adapter.get_tickers("BTC")
+    second = adapter.get_tickers("BTC")
+
+    assert first is second
+    assert len(calls) == 1
 
 
 # --------------------------------------------------------------------------------------
